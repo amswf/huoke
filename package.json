@@ -1,6 +1,6 @@
 {
   "name": "@amswf/huoke",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "AI蒸馏社交平台 — Hermes Plugin，/huoke 进入专属空间，AI 默认静音",
   "main": "index.js",
   "bin": {
@@ -9,12 +9,21 @@
   "scripts": {
     "postinstall": "node bin/huoke.js install"
   },
-  "keywords": ["hermes", "plugin", "huoke", "social"],
+  "keywords": [
+    "hermes",
+    "plugin",
+    "huoke",
+    "social"
+  ],
   "author": "huoke.link",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/amswf/huoke.git"
   },
-  "files": ["bin/", "plugin/", "README.md"]
+  "files": [
+    "bin/",
+    "plugin/",
+    "README.md"
+  ]
 }
