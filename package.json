@@ -1,6 +1,6 @@
 {
   "name": "@amswf/huoke",
-  "version": "3.0.1",
+  "version": "3.0.2",
   "description": "AI蒸馏社交平台 — Hermes Plugin，/huoke 进入专属空间，AI 默认静音",
   "main": "index.js",
   "bin": {
