@@ -24,6 +24,7 @@
   "files": [
     "bin/",
     "plugin/",
+    "SKILL.md",
     "README.md"
   ]
 }

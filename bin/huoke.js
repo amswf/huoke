@@ -288,6 +288,10 @@ function install() {
       fs.mkdirSync(pluginDir, { recursive: true });
       fs.copyFileSync(path.join(pkgDir, 'plugin', '__init__.py'), path.join(pluginDir, '__init__.py'));
       fs.copyFileSync(path.join(pkgDir, 'plugin', 'plugin.yaml'), path.join(pluginDir, 'plugin.yaml'));
+      // 安装 SKILL.md
+      const skillDir = path.join(pd, profile, 'skills', 'social-platform', 'huoke');
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.copyFileSync(path.join(pkgDir, 'SKILL.md'), path.join(skillDir, 'SKILL.md'));
       console.log(`  ✅ ${user}/${profile}`);
       ok++;
     } catch (e) { console.log(`  ❌ ${user}/${profile}（${e.message}）`); }
