@@ -2,16 +2,21 @@
 huoke Hermes Plugin — /huoke 专属空间，AI 默认静音
 
 架构：
-  1. register_command("/huoke") → 进入 huoke 模式，处理 /huoke 开头的消息
-  2. pre_gateway_dispatch hook  → gateway(Telegram/Discord) 下拦截模式内所有消息
-     返回 {"action": "skip"} → 消息不到 LLM，零 AI 参与
-  3. pre_llm_call hook          → CLI 下拦截模式内消息
-     注入处理结果，AI 只做展示管道
+  1. register_command("/huoke") → 进入 huoke 模式
+  2. pre_gateway_dispatch hook → Gateway 下拦截模式内消息 → skip（零 AI）
+  3. pre_llm_call hook → CLI 下注入结果（AI 只做展示管道）
 
-状态管理：
-  CLI 模式：单用户，固定 key "_cli"
-  Gateway 模式：按 chat_id 隔离
-  状态持久化到 JSON 文件，跨消息调用不丢失
+后端 API 与 huoke_cli.py 对齐：
+  /api/agent/check-user      检查用户
+  /api/agent/send-code        发验证码
+  /api/agent/verify-code      校验验证码 + 绑定 openclaw_id
+  /api/agent/set-password     设置密码
+  /api/agent/upload-persona   上传人设
+  /api/agent/sync-interactions 拉取互动
+  /api/agent/comment          回复帖子
+
+状态机：
+  awaiting_email → awaiting_code → setting_password → logged_in
 """
 import logging
 import subprocess
@@ -21,81 +26,94 @@ import re
 
 logger = logging.getLogger(__name__)
 
-# ─── 状态管理 ────────────────────────────────────────────────────────────
+# ─── 状态 ────────────────────────────────────────────────────────────────
 _STATE_DIR = os.path.join(os.path.dirname(__file__), '.state')
 
 
-def _state_path(key: str) -> str:
+def _path(key):
     os.makedirs(_STATE_DIR, exist_ok=True)
-    safe = re.sub(r'[^\w\-.]', '_', key)
-    return os.path.join(_STATE_DIR, f'{safe}.json')
+    safe_key = re.sub(r'[^\w\-.]', '_', key)
+    return os.path.join(_STATE_DIR, f'{safe_key}.json')
 
 
-def _load(key: str) -> dict:
+def _load(key):
     try:
-        with open(_state_path(key), 'r') as f:
+        with open(_path(key)) as f:
             return json.load(f)
     except Exception:
         return {}
 
 
-def _save(key: str, state: dict):
+def _save(key, s):
     try:
         os.makedirs(_STATE_DIR, exist_ok=True)
-        with open(_state_path(key), 'w') as f:
-            json.dump(state, f)
+        with open(_path(key), 'w') as f:
+            json.dump(s, f)
     except Exception:
         pass
 
 
-def _clear(key: str):
+def _clear(key):
     try:
-        os.remove(_state_path(key))
+        os.remove(_path(key))
     except Exception:
         pass
 
 
-# ─── 子进程环境 ──────────────────────────────────────────────────────────
+# ─── 环境 ────────────────────────────────────────────────────────────────
 def _env():
     home = '/home/zheng'
     try:
-        user = os.environ.get('USER', '')
-        if user:
-            pw = subprocess.check_output(
-                f'getent passwd "{user}"', shell=True, timeout=3, text=True
-            ).strip()
+        u = os.environ.get('USER', '')
+        if u:
+            pw = subprocess.check_output(f'getent passwd "{u}"', shell=True, timeout=3, text=True).strip()
             home = pw.split(':')[5].strip()
     except Exception:
         pass
     return {
-        **os.environ,
-        'HOME': home,
+        **os.environ, 'HOME': home,
         'PATH': f'/home/zheng/.config/nvm/versions/node/v24.15.0/bin:{os.environ.get("PATH", "")}',
     }
 
 
-# ─── 调用 huoke CLI ─────────────────────────────────────────────────────
-def _run(args: str) -> str:
-    cmd = f'huoke run-flow {args}'.strip()
+def _run(cmd_args: str) -> dict:
+    """调用 huoke CLI，返回解析后的 JSON dict"""
+    cmd = f'huoke {cmd_args}'.strip()
     try:
-        r = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            timeout=30, env=_env(),
-        )
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, env=_env())
         out = r.stdout.strip()
-        if r.stderr.strip():
-            out = (out + '\n' + r.stderr.strip()).strip()
-        return out or '(无输出)'
+        if not out and r.stderr.strip():
+            return {'type': 'error', 'text': r.stderr.strip()}
+        try:
+            return json.loads(out)
+        except Exception:
+            return {'type': 'raw', 'text': out or '(无输出)'}
     except subprocess.TimeoutExpired:
-        return '⏱️ 超时，请重试'
+        return {'type': 'error', 'text': '⏱️ 超时'}
     except Exception as e:
-        logger.error('huoke failed: %s', e)
-        return f'❌ 失败: {e}'
+        return {'type': 'error', 'text': f'❌ {e}'}
 
 
-# ─── 核心状态机 ──────────────────────────────────────────────────────────
-def _process(key: str, msg: str) -> str:
-    """根据状态和消息执行 CLI，返回输出。"""
+# ─── openclaw_id ─────────────────────────────────────────────────────────
+# CLI 模式没有 openclaw_id，用固定值
+_CLI_OPENCLAW_ID = 'cli_user'
+
+
+def _get_openclaw_id(**kwargs):
+    """从 hook kwargs 或环境变量中获取 openclaw_id"""
+    # 优先从 kwargs
+    sid = kwargs.get('session_id', '')
+    sender = kwargs.get('sender_id', '')
+    if sender:
+        return sender
+    if sid:
+        return sid
+    # 从环境变量
+    return os.environ.get('_HUOKE_OPENCLAW_ID', _CLI_OPENCLAW_ID)
+
+
+# ─── 状态机 ──────────────────────────────────────────────────────────────
+def _process(key, openclaw_id, msg) -> str:
     state = _load(key)
     phase = state.get('phase', '')
 
@@ -109,87 +127,124 @@ def _process(key: str, msg: str) -> str:
         _clear(key)
         msg = ''
 
-    # ── 入口：无参数 ────────────────────────────────────────────────
+    # ── 入口 ────────────────────────────────────────────────────────
     if not msg:
         _clear(key)
-        output = _run('')
-        _save(key, {'phase': 'awaiting_email'})
-        return output
+        r = _run(f'entry "{openclaw_id}"')
+        text = r.get('text', str(r))
+        rtype = r.get('type', '')
+        if rtype == 'welcome':
+            _save(key, {'phase': 'awaiting_email', 'openclaw_id': openclaw_id})
+        elif rtype == 'menu':
+            _save(key, {
+                'phase': 'logged_in',
+                'openclaw_id': openclaw_id,
+                'timeline': r.get('timeline', []),
+            })
+        else:
+            _save(key, {'phase': 'awaiting_email', 'openclaw_id': openclaw_id})
+        return text
 
-    # ── 等邮箱（含 @） ──────────────────────────────────────────────
+    # ── 等邮箱 ──────────────────────────────────────────────────────
     if phase == 'awaiting_email' and '@' in msg and '.' in msg:
         email = msg.strip().lower()
-        output = _run(f'--email "{email}"')
-        _save(key, {'phase': 'awaiting_code', 'email': email})
-        return output
+        r = _run(f'do-email "{openclaw_id}" "{email}"')
+        _save(key, {'phase': 'awaiting_code', 'openclaw_id': openclaw_id, 'email': email})
+        return r.get('text', str(r))
 
-    # ── 等验证码（6位数字） ────────────────────────────────────────
+    # ── 等验证码 ────────────────────────────────────────────────────
     if phase == 'awaiting_code' and re.fullmatch(r'\d{6}', msg.strip()):
         email = state.get('email', '')
         code = msg.strip()
-        output = _run(f'--email "{email}" --code "{code}"')
-        if '登录成功' in output or '已登录' in output:
-            _save(key, {'phase': 'logged_in', 'email': email})
-        return output
+        r = _run(f'do-verify "{openclaw_id}" "{email}" "{code}"')
+        text = r.get('text', '')
+        rtype = r.get('type', '')
+        if rtype == 'verified':
+            _save(key, {'phase': 'setting_password', 'openclaw_id': openclaw_id, 'email': email, 'code': code})
+        return text or str(r)
 
-    # ── 已登录：发帖/回复/跳过 ──────────────────────────────────────
+    # ── 等密码 ──────────────────────────────────────────────────────
+    if phase == 'setting_password':
+        email = state.get('email', '')
+        code = state.get('code', '')
+        password = msg.strip()
+        r = _run(f'do-password "{openclaw_id}" "{email}" "{code}" "{password}"')
+        text = r.get('text', '')
+        rtype = r.get('type', '')
+        if rtype == 'registered':
+            _clear(key)
+        return text or str(r)
+
+    # ── 已登录：操作 ────────────────────────────────────────────────
     if phase == 'logged_in':
         if msg in ('跳过', 'skip', '取消'):
+            r = _run(f'do-action "{openclaw_id}" skip')
             _clear(key)
-            return '好的，下次 /huoke 再见！👋'
+            return r.get('text', str(r))
+
         if msg.lower().startswith('r '):
+            # r <编号> [回复内容]
             parts = msg.split(None, 2)
             idx = parts[1] if len(parts) > 1 else ''
             reply = parts[2] if len(parts) > 2 else ''
-            return _run(f'--action "r {idx}" --reply "{reply}"')
-        return _run(f'--action "{msg}"')
+            timeline = state.get('timeline', [])
+            try:
+                post = timeline[int(idx) - 1]
+                post_id = post.get('id', '')
+            except (IndexError, ValueError):
+                return f'❌ 帖子编号 {idx} 不存在'
+            if not reply:
+                return f'📩 回复对象：{(post.get("content", "")[:60])}…\n请输入回复内容：'
+            r = _run(f'do-reply {post_id} "{openclaw_id}" "{reply}"')
+            return r.get('text', str(r))
 
-    # ── 未知状态 → 重新开始 ─────────────────────────────────────────
+        # 默认当发帖
+        r = _run(f'do-post "{openclaw_id}" "{msg}"')
+        return r.get('text', str(r))
+
+    # ── 未知 → 重新开始 ─────────────────────────────────────────────
     _clear(key)
-    output = _run('')
-    _save(key, {'phase': 'awaiting_email'})
-    return output
+    return _process(key, openclaw_id, '')
 
 
-# ─── 1. /huoke 命令 ─────────────────────────────────────────────────────
+# ─── /huoke 命令 ─────────────────────────────────────────────────────────
 def handle_huoke(raw_args: str) -> str:
-    """
-    register_command 签名: fn(raw_args: str) -> str | None
-    CLI 模式用固定 key "_cli"
-    """
+    """register_command 签名: fn(raw_args: str) -> str | None"""
     msg = raw_args.strip() if raw_args else ''
+    openclaw_id = os.environ.get('_HUOKE_OPENCLAW_ID', _CLI_OPENCLAW_ID)
+    key = '_cli'
 
     if not msg:
-        # 进入模式
-        result = _process('_cli', '')
-        return result + '\n\n💡 输入 exit 退出 huoke 模式'
+        result = _process(key, openclaw_id, '')
+        state = _load(key)
+        if state.get('phase'):
+            return result + '\n\n💡 输入 exit 退出 huoke 模式'
+        return result
 
-    return _process('_cli', msg)
+    return _process(key, openclaw_id, msg)
 
 
-# ─── 2. Gateway 消息拦截 ────────────────────────────────────────────────
+# ─── Gateway 拦截 ───────────────────────────────────────────────────────
 def on_gateway_dispatch(event=None, gateway=None, session_store=None, **kwargs):
-    """
-    pre_gateway_dispatch hook。
-    检查当前 chat 是否在 huoke 模式 → 拦截 → skip（不到 LLM）。
-    """
     if event is None:
         return None
 
     text = getattr(event, 'text', '') or ''
     source = getattr(event, 'source', None)
     chat_id = str(getattr(source, 'chat_id', '') or 'default')
+    sender_id = str(getattr(source, 'user_id', '') or chat_id)
 
     state = _load(chat_id)
     if not state.get('phase'):
-        return None  # 不在模式内，放行
+        return None
 
     msg = text.strip()
     if msg.lower().startswith('/huoke'):
-        return None  # 放行给 register_command
+        return None
 
-    # huoke 模式内 → 处理 + 拦截
-    output = _process(chat_id, msg)
+    openclaw_id = state.get('openclaw_id', sender_id)
+    output = _process(chat_id, openclaw_id, msg)
+
     if gateway and output:
         try:
             gateway.send_text(chat_id, output)
@@ -199,33 +254,28 @@ def on_gateway_dispatch(event=None, gateway=None, session_store=None, **kwargs):
     return {'action': 'skip', 'reason': 'huoke mode'}
 
 
-# ─── 3. CLI 拦截 ────────────────────────────────────────────────────────
+# ─── CLI 拦截 ────────────────────────────────────────────────────────────
 def on_pre_llm_call(**kwargs):
-    """
-    pre_llm_call hook（CLI 模式）。
-    pre_llm_call 无法阻止 LLM，但可以把处理结果注入到上下文，
-    让 AI 只做展示管道。
-    """
     user_message = kwargs.get('user_message', '') or ''
+    session_id = kwargs.get('session_id', '') or '_cli'
 
-    # /huoke 开头的消息由 register_command 处理
+    # 存 session_id 供 register_command 使用
+    os.environ['_HUOKE_OPENCLAW_ID'] = session_id
+
     if user_message.strip().lower().startswith('/huoke'):
         return None
 
-    # 检查 CLI 状态
     state = _load('_cli')
     if not state.get('phase'):
-        return None  # 不在模式内，放行
+        return None
 
-    # huoke 模式内 → 处理并注入
-    msg = user_message.strip()
-    output = _process('_cli', msg)
+    openclaw_id = state.get('openclaw_id', session_id)
+    output = _process('_cli', openclaw_id, user_message.strip())
 
     return {
         'context': (
-            '[huoke plugin 已处理此消息。以下是结果。'
-            '你必须原样输出以下内容，不添加任何文字、评论、问候：]\n\n'
-            + output
+            '[huoke plugin 已处理此消息。你必须原样输出以下内容，'
+            '不添加任何文字、评论、问候、总结：]\n\n' + output
         )
     }
 
