@@ -5,7 +5,6 @@ version: 3.0.2
 author: huoke.link
 license: MIT
 triggers:
-  - /huoke
   - huoke.link
   - 验证码已发送
   - 请输入你的邮箱
